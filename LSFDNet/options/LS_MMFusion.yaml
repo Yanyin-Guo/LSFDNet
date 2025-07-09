@@ -1,0 +1,123 @@
+# general settings
+name: train_MMFuion
+model_type: MMFusion
+phase: train
+num_gpu: 1
+manual_seed: 0
+
+
+# dataset and data loader settings
+datasets:
+  train:
+    name: train
+    type: OSLSP_FusionDataset
+    crop_size: 320
+    LW_path: '/data/NSLSR_train/LWIR/'
+    SW_path: '/data/NSLSR_train/SWIR/'
+    paired_path: '/data/NSLSR_train/gama/'
+    label_path: '/data/NSLSR_train/labels/'
+    is_crop: True
+    is_size: False
+    is_pad: False
+    batch_size_per_gpu: 16
+    num_worker_per_gpu: 6
+    pin_memory: True
+    data_len: -1
+
+  val:
+    # Please modify accordingly to use your own validation
+    # Or comment the val block if do not need validation during training
+    name: val
+    type: OSLSP_FusionDataset
+    crop_size: 320
+    LW_path: '/data/NSLSR_test/LWIR/'
+    SW_path: '/data/NSLSR_test/SWIR/'
+    paired_path: '/data/NSLSR_test/gama/'
+    label_path: '/data/NSLSR_test/labels/'
+    is_crop: True
+    is_size: False
+    is_pad: False
+    batch_size_per_gpu: 16
+    num_worker_per_gpu: 1
+    pin_memory: True
+    data_len: -1
+
+
+# network structures
+network_fusion:
+  type: MMFusion
+
+# path
+path:
+  pretrain_network_MMFusion: ~
+  training_states:
+  strict_load_g: true
+  resume_state: ~
+
+# training settings
+train:
+  a: 0.8 
+  b: 0.5 
+  c: 0.5  
+  #n_epoch: 300
+  optimizer:
+    type: Adam
+    lr: !!float 1e-4
+
+  scheduler:
+    type: MultiStepLR
+    milestones: [50000, 75000, 100000, 150000, 200000]
+    gamma: 0.5
+
+  total_iter: 300000
+  warmup_iter: 500  # -1 no warm up
+
+  #Loss
+  Loss_OE:
+    type: Fusionloss_LS
+
+val:
+  pbar: true
+  start_val: 0
+  val_freq: !!float 500
+  save_img: true
+ 
+  metrics:
+    EN: 
+      type: ~
+    SF: 
+      type: ~
+    AG: 
+      type: ~
+    SD: 
+      type: ~
+    CC: 
+      type: ~
+    SCD: 
+      type: ~
+    MSE: 
+      type: ~
+      better: lower
+    PSNR: 
+      type: ~
+    Qabf: 
+      type: ~
+    Nabf: 
+      type: ~
+      better: lower
+
+
+# logging settings
+logger:
+  print_freq: 50
+  start_save: 0
+  save_checkpoint_freq: !!float 500
+  use_tb_logger: true
+  wandb:
+    project: ~
+    resume_id: ~
+
+# dist training settings
+dist_params:
+  backend: nccl
+  port: 29500
