@@ -11,10 +11,9 @@
 
 ## 1. Motivation & Contribution
 ![image-Motivation](./imgs/SWIR.png)
-<div style="margin-bottom: 20px;">
+<div style="margin-bottom: 30px;">
   &emsp;&emsp;&emsp;&emsp;<span>(a) fog penetration</span>
-  &emsp;&emsp;&emsp;&emsp;&emsp;&emsp;&emsp;&emsp;&emsp;&emsp;&emsp;&emsp;&emsp;&emsp;&emsp;&emsp;&emsp;
-  <span>(b) sea surface contrast</span>
+  &emsp;&emsp;&emsp;&emsp;&emsp;&emsp;&emsp;&emsp;&emsp;&emsp;&emsp;&emsp;&emsp;&emsp;&emsp;&emsp;<span>(b) sea surface contrast</span>
 </div>
 
 > SWIR (Top) vs. Visible (Bottom) Imaging.
