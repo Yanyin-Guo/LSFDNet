@@ -12,7 +12,8 @@
 ## 1. Motivation & Contribution
 ![image-Motivation](./imgs/SWIR.png)
 <div style="margin-bottom: 20px;">
-  &emsp;&emsp;&emsp;&emsp;&emsp;&emsp;<span>(a) fog penetration</span>&emsp;&emsp;&emsp;&emsp;&emsp;&emsp;&emsp;&emsp;&emsp;&emsp;&emsp;&emsp;&emsp;&emsp;&emsp;&emsp;&emsp;&emsp;&emsp;&emsp;&emsp;&emsp;&emsp;
+  &emsp;&emsp;&emsp;&emsp;<span>(a) fog penetration</span>
+  &emsp;&emsp;&emsp;&emsp;&emsp;&emsp;&emsp;&emsp;&emsp;&emsp;&emsp;&emsp;&emsp;&emsp;&emsp;&emsp;&emsp;
   <span>(b) sea surface contrast</span>
 </div>
 
