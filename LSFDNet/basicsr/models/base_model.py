@@ -4,6 +4,7 @@ import torch
 from collections import OrderedDict
 from copy import deepcopy
 from torch.nn.parallel import DataParallel, DistributedDataParallel
+from torch import optim
 
 from basicsr.models import lr_scheduler as lr_scheduler
 from basicsr.utils import get_root_logger
@@ -17,6 +18,7 @@ class BaseModel():
         self.opt = opt
         self.device = torch.device('cuda' if opt['num_gpu'] != 0 else 'cpu')
         self.is_train = opt['is_train']
+        self.total_epochs = opt.get('total_epochs', 100)
         self.schedulers = []
         self.optimizers = []
 
@@ -113,6 +115,27 @@ class BaseModel():
         """Set up schedulers."""
         train_opt = self.opt['train']
         scheduler_type = train_opt['scheduler'].pop('type')
+        if scheduler_type in ['MultiStepLR', 'StepLR']:
+            for optimizer in self.optimizers:
+                self.schedulers.append(optim.lr_scheduler.MultiStepLR(optimizer, **train_opt['scheduler']))
+        elif scheduler_type == 'LambdaLR':
+            assert len(self.optimizers) == len(train_opt['scheduler']), 'The number of optimizers should be equal to the number of lambda schedulers.'
+            lambdas = [lambda x, lrf=lrf: max(1 - x / self.total_epochs, 0) * (1.0 - lrf) + lrf for lrf in train_opt['scheduler'].values()]
+            for i, optimizer in enumerate(self.optimizers):
+                self.schedulers.append(optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lambdas[i]))
+        elif scheduler_type == 'CosineAnnealingLR':
+            for optimizer in self.optimizers:
+                self.schedulers.append(optim.lr_scheduler.CosineAnnealingLR(optimizer, **train_opt['scheduler']))
+        elif scheduler_type == 'PolyLR':
+            for optimizer in self.optimizers:
+                self.schedulers.append(optim.lr_scheduler.PolynomialLR(optimizer, **train_opt['scheduler']))
+        else:
+            raise NotImplementedError(f'Scheduler {scheduler_type} is not implemented yet.')
+
+    def iter_setup_schedulers(self):
+        """Set up schedulers."""
+        train_opt = self.opt['train']
+        scheduler_type = train_opt['scheduler'].pop('type')
         if scheduler_type in ['MultiStepLR', 'MultiStepRestartLR']:
             for optimizer in self.optimizers:
                 self.schedulers.append(lr_scheduler.MultiStepRestartLR(optimizer, **train_opt['scheduler']))
@@ -176,7 +199,30 @@ class BaseModel():
             init_lr_groups_l.append([v['initial_lr'] for v in optimizer.param_groups])
         return init_lr_groups_l
 
-    def update_learning_rate(self, current_iter, warmup_iter=-1):
+    def update_learning_rate(self, current_iter, epoch, warmup_iter=-1):
+        """Update learning rate.
+
+        Args:
+            current_iter (int): Current iteration.
+            warmup_iter (int)： Warmup iter numbers. -1 for no warmup.
+                Default： -1.
+        """
+        if current_iter > 1:
+            for scheduler in self.schedulers:
+                scheduler.step(epoch)
+        # set up warm-up learning rate
+        if current_iter <= warmup_iter:
+            # get initial lr for each group
+            init_lr_g_l = self._get_init_lr()
+            # modify warming-up learning rates
+            # currently only support linearly warm up
+            warm_up_lr_l = []
+            for init_lr_g in init_lr_g_l:
+                warm_up_lr_l.append([v / warmup_iter * current_iter for v in init_lr_g])
+            # set learning rate
+            self._set_lr(warm_up_lr_l)
+
+    def iter_update_learning_rate(self, current_iter, warmup_iter=-1):
         """Update learning rate.
 
         Args:
@@ -305,12 +351,25 @@ class BaseModel():
                 logger.info('Loading: params_ema does not exist, use params.')
             load_net = load_net[param_key]
         logger.info(f'Loading {net.__class__.__name__} model from {load_path}, with param key: [{param_key}].')
+
+        current_model_keys = list(net.state_dict().keys())
+        is_model_compiled = any(k.startswith('_orig_mod.') for k in current_model_keys)
+        smart_state_dict = {}
+        for k, v in load_net.items():
+            clean_key = k.replace('_orig_mod.', '')
+            if is_model_compiled:
+                final_key = f'_orig_mod.{clean_key}'
+            else:
+                final_key = clean_key
+            smart_state_dict[final_key] = v
+        load_net = smart_state_dict
         # remove unnecessary 'module.'
         for k, v in deepcopy(load_net).items():
             if k.startswith('module.'):
                 load_net[k[7:]] = v
                 load_net.pop(k)
         self._print_different_keys_loading(net, load_net, strict)
+
         net.load_state_dict(load_net, strict=strict)
 
     @master_only

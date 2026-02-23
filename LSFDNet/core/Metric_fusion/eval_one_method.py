@@ -4,11 +4,52 @@ from Metric import *
 from natsort import natsorted
 from tqdm import tqdm
 import os
+import cv2
 import warnings
 from openpyxl import Workbook, load_workbook
 from openpyxl.utils import get_column_letter
+from basicsr.utils import get_root_logger,tensor2img,imwrite
 warnings.filterwarnings("ignore")
 
+def evaluation_pic_fast(visual, crop_size=(768,768)):
+    metric_fusion={}
+    f_img_cropped = center_crop(cv2.cvtColor(tensor2img(visual['pred_img']), cv2.COLOR_BGR2GRAY), crop_size)  
+    ir_img_cropped = center_crop(cv2.cvtColor(tensor2img(visual['gt_ir']), cv2.COLOR_BGR2GRAY), crop_size)  
+    vi_img_cropped = center_crop(cv2.cvtColor(tensor2img(visual['gt_vi']), cv2.COLOR_BGR2GRAY), crop_size) 
+    
+    f_img_int = np.array(f_img_cropped).astype(np.int32)  
+    f_img_double = np.array(f_img_cropped).astype(np.float32)  
+    ir_img_double = np.array(ir_img_cropped).astype(np.float32)  
+    vi_img_double = np.array(vi_img_cropped).astype(np.float32)
+
+
+    EN = EN_function(f_img_int)
+    #MI = MI_function(ir_img_int, vi_img_int, f_img_int, gray_level=256) ##slow
+
+    SF = SF_function(f_img_double)
+    SD = SD_function(f_img_double)
+    AG = AG_function(f_img_double)
+    PSNR = PSNR_function(ir_img_double, vi_img_double, f_img_double)
+    MSE = MSE_function(ir_img_double, vi_img_double, f_img_double)
+    #VIF = VIF_function(ir_img_double, vi_img_double, f_img_double) ##slow
+    CC = CC_function(ir_img_double, vi_img_double, f_img_double)
+    SCD = SCD_function(ir_img_double, vi_img_double, f_img_double)
+    Qabf = Qabf_function(ir_img_double, vi_img_double, f_img_double)
+    Nabf = Nabf_function(ir_img_double, vi_img_double, f_img_double)
+    #SSIM = SSIM_function(ir_img_double, vi_img_double, f_img_double) ##slow
+    #MS_SSIM = MS_SSIM_function(ir_img_double, vi_img_double, f_img_double) ##very slow
+    metric_fusion['EN'] = EN
+    metric_fusion['SF'] = SF
+    metric_fusion['AG'] = AG
+    metric_fusion['SD'] = SD
+    metric_fusion['CC'] = CC
+    metric_fusion['SCD'] = SCD
+    metric_fusion['MSE'] = MSE
+    metric_fusion['PSNR'] = PSNR
+    metric_fusion['Qabf'] = Qabf
+    metric_fusion['Nabf'] = Nabf
+
+    return metric_fusion
 
 def write_excel(excel_name='metric.xlsx', worksheet_name='VIF', column_index=0, data=None):
     try:
@@ -29,8 +70,25 @@ def write_excel(excel_name='metric.xlsx', worksheet_name='VIF', column_index=0, 
         cell.value = value
         
     workbook.save(excel_name)
-
-def evaluation_one(ir_name, vi_name, f_name):
+def center_crop(img, crop_size=(768, 768)):
+    if isinstance(img, np.ndarray):
+        h, w = img.shape[:2]  
+    elif isinstance(img, Image.Image):
+        w, h = img.size
+    else:
+        raise ValueError("Input  is must numpy。")
+    crop_w, crop_h = crop_size
+    if crop_h > h or crop_w > w:
+        raise ValueError("Crop size should < ori_size")
+    top = (h - crop_h) // 2
+    left = (w - crop_w) // 2
+    bottom = top + crop_h
+    right = left + crop_w
+    if isinstance(img, np.ndarray):
+        return img[top:bottom, left:right]
+    elif isinstance(img, Image.Image):
+        return img.crop((left, top, right, bottom))
+def evaluation_one(ir_name, vi_name, f_name, crop_size=(768,768)):
     try:
         f_img = Image.open(f_name).convert('L')
         ir_img = Image.open(ir_name).convert('L')
@@ -44,15 +102,19 @@ def evaluation_one(ir_name, vi_name, f_name):
         f_img = Image.open(f_name).convert('L')
         ir_img = Image.open(ir_name).convert('L')
         vi_img = Image.open(vi_name).convert('L')
+    
+    f_img_cropped = center_crop(f_img, crop_size)  
+    ir_img_cropped = center_crop(ir_img, crop_size)  
+    vi_img_cropped = center_crop(vi_img, crop_size) 
 
-    f_img_int = np.array(f_img).astype(np.int32)
-    f_img_double = np.array(f_img).astype(np.float32)
+    f_img_int = np.array(f_img_cropped).astype(np.int32)
+    f_img_double = np.array(f_img_cropped).astype(np.float32)
 
-    ir_img_int = np.array(ir_img).astype(np.int32)
-    ir_img_double = np.array(ir_img).astype(np.float32)
+    ir_img_int = np.array(ir_img_cropped).astype(np.int32)
+    ir_img_double = np.array(ir_img_cropped).astype(np.float32)
 
-    vi_img_int = np.array(vi_img).astype(np.int32)
-    vi_img_double = np.array(vi_img).astype(np.float32)
+    vi_img_int = np.array(vi_img_cropped).astype(np.int32)
+    vi_img_double = np.array(vi_img_cropped).astype(np.float32)
 
     EN = EN_function(f_img_int)
     MI = MI_function(ir_img_int, vi_img_int, f_img_int, gray_level=256) ##slow
@@ -71,7 +133,7 @@ def evaluation_one(ir_name, vi_name, f_name):
     MS_SSIM = MS_SSIM_function(ir_img_double, vi_img_double, f_img_double) ##very slow
     return EN, MI, SF, AG, SD, CC, SCD, VIF, MSE, PSNR, Qabf, Nabf, SSIM, MS_SSIM
 
-def evaluation_one_fast(ir_name, vi_name, f_name):
+def evaluation_one_test(ir_name, vi_name, f_name, crop_size=(768,768)):
     try:
         f_img = Image.open(f_name).convert('L')
         ir_img = Image.open(ir_name).convert('L')
@@ -85,14 +147,53 @@ def evaluation_one_fast(ir_name, vi_name, f_name):
         f_img = Image.open(f_name).convert('L')
         ir_img = Image.open(ir_name).convert('L')
         vi_img = Image.open(vi_name).convert('L')
+    
+    f_img_cropped = center_crop(f_img, crop_size)  
+    ir_img_cropped = center_crop(ir_img, crop_size)  
+    vi_img_cropped = center_crop(vi_img, crop_size) 
 
+    f_img_int = np.array(f_img_cropped).astype(np.int32)
+    f_img_double = np.array(f_img_cropped).astype(np.float32)
 
-    f_img_int = np.array(f_img).astype(np.int32)
-    f_img_double = np.array(f_img).astype(np.float32)
+    ir_img_int = np.array(ir_img_cropped).astype(np.int32)
+    ir_img_double = np.array(ir_img_cropped).astype(np.float32)
 
-    ir_img_double = np.array(ir_img).astype(np.float32)
+    vi_img_int = np.array(vi_img_cropped).astype(np.int32)
+    vi_img_double = np.array(vi_img_cropped).astype(np.float32)
 
-    vi_img_double = np.array(vi_img).astype(np.float32)
+    MI = MI_function(ir_img_int, vi_img_int, f_img_int, gray_level=256) ##slow
+
+    SF = SF_function(f_img_double)
+    PSNR = PSNR_function(ir_img_double, vi_img_double, f_img_double)
+    VIF = VIF_function(ir_img_double, vi_img_double, f_img_double) ##slow
+    Qabf = Qabf_function(ir_img_double, vi_img_double, f_img_double)
+    return MI, SF, VIF, PSNR, Qabf
+
+def image_open(name):
+    try:
+        img = Image.open(name).convert('L')
+    except:
+        l = name.split('.')[-1]
+        if l=='jpg':
+            name = name.split('.')[0]+'.png'
+        else:
+            name = name.split('.')[0]+'.jpg'
+        img = Image.open(name).convert('L')
+    return img
+
+def evaluation_one_fast(ir_name, vi_name, f_name, crop_size=(768,768)):
+    f_img = image_open(f_name)
+    ir_img = image_open(ir_name)
+    vi_img = image_open(vi_name)
+
+    f_img_cropped = center_crop(f_img, crop_size)  
+    ir_img_cropped = center_crop(ir_img, crop_size)  
+    vi_img_cropped = center_crop(vi_img, crop_size) 
+    
+    f_img_int = np.array(f_img_cropped).astype(np.int32)  
+    f_img_double = np.array(f_img_cropped).astype(np.float32)  
+    ir_img_double = np.array(ir_img_cropped).astype(np.float32)  
+    vi_img_double = np.array(vi_img_cropped).astype(np.float32)
 
     EN = EN_function(f_img_int)
     #MI = MI_function(ir_img_int, vi_img_int, f_img_int, gray_level=256) ##slow
@@ -113,7 +214,7 @@ def evaluation_one_fast(ir_name, vi_name, f_name):
 
 
 # @METRIC_REGISTRY.register()
-def evaluation_one_method_fast(dataset_name='NSLSR_test', data_dir='./data', result_dir='/IRFusion-main/LSFDNet/test/NSLSR/LSFDNet_320', save_dir='/IRFusion-main/LSFDNet/test/metric_LSFDNet.xlsx', Method='LSFDNet' , with_mean=True):
+def evaluation_one_method_fast(dataset_name='NSLSR_test', data_dir='./data', result_dir='./LSFDNet/test/NSLSR/LSFDNet_320', save_dir='./LSFDNet/test/metric_LSFDNet.xlsx', Method='LSFDNet' , with_mean=True, crop_size=(768,768)):
     EN_list = []
     SF_list = []
     AG_list = []
@@ -125,19 +226,19 @@ def evaluation_one_method_fast(dataset_name='NSLSR_test', data_dir='./data', res
     Qabf_list = []
     Nabf_list = []
     filename_list = []
-    ir_dir = os.path.join(data_dir, dataset_name, 'LWIR')
-    vi_dir = os.path.join(data_dir, dataset_name, 'SWIR')
+    ir_dir = os.path.join(data_dir, 'LWIR')
+    vi_dir = os.path.join(data_dir, 'SWIR')
     # f_dir = os.path.join(result_dir, dataset_name, Method)
     f_dir = result_dir
     metric_save_name = save_dir
-    filelist = natsorted(os.listdir(f_dir))
+    filelist = natsorted([file for file in os.listdir(ir_dir) if file.lower().endswith(('.jpg', '.png'))])
     eval_bar = tqdm(filelist)
     for _, item in enumerate(eval_bar):
         ir_name = os.path.join(ir_dir, item)
         vi_name = os.path.join(vi_dir, item)
         f_name = os.path.join(f_dir, item)
         #EN, MI, SF, AG, SD, CC, SCD, VIF, MSE, PSNR, Qabf, Nabf, SSIM, MS_SSIM = evaluation_one(ir_name, vi_name, f_name)
-        EN, SF, AG, SD, CC, SCD, MSE, PSNR, Qabf, Nabf = evaluation_one_fast(ir_name, vi_name, f_name)
+        EN, SF, AG, SD, CC, SCD, MSE, PSNR, Qabf, Nabf = evaluation_one_fast(ir_name, vi_name, f_name, crop_size)
         EN_list.append(EN)
         SF_list.append(SF)
         AG_list.append(AG)
@@ -224,7 +325,7 @@ def evaluation_one_method_fast(dataset_name='NSLSR_test', data_dir='./data', res
 
     return EN_list[-2:-1], SF_list[-2:-1], AG_list[-2:-1], SD_list[-2:-1], CC_list[-2:-1], SCD_list[-2:-1], MSE_list[-2:-1], PSNR_list[-2:-1], Qabf_list[-2:-1], Nabf_list[-2:-1]
 
-def evaluation_one_method(dataset_name='NSLSR_test', data_dir='./data/', result_dir='/IRFusion-main/LSFDNet/test/NSLSR/LSFDNet_320', save_dir='/IRFusion-main/LSFDNet/test/metric_LSFDNet.xlsx', Method='LSFDNet' , with_mean=True):
+def evaluation_one_method(dataset_name='NSLSR_test', data_dir='./data/', result_dir='./LSFDNet/test/NSLSR/LSFDNet_320', save_dir='./LSFDNet/test/metric_LSFDNet.xlsx', Method='LSFDNet' , with_mean=True, crop_size=(768,768)):
     EN_list = []
     MI_list = []
     SF_list = []
@@ -240,17 +341,17 @@ def evaluation_one_method(dataset_name='NSLSR_test', data_dir='./data/', result_
     SSIM_list = []
     MS_SSIM_list = []
     filename_list = []
-    ir_dir = os.path.join(data_dir, dataset_name, 'LWIR')
-    vi_dir = os.path.join(data_dir, dataset_name, 'SWIR')
+    ir_dir = os.path.join(data_dir, 'ir')
+    vi_dir = os.path.join(data_dir, 'vi')
     f_dir = result_dir
     metric_save_name = save_dir
-    filelist = natsorted(os.listdir(f_dir))
+    filelist = natsorted([file for file in os.listdir(ir_dir) if file.lower().endswith(('.jpg', '.png'))])
     eval_bar = tqdm(filelist)
     for _, item in enumerate(eval_bar):
         ir_name = os.path.join(ir_dir, item)
         vi_name = os.path.join(vi_dir, item)
         f_name = os.path.join(f_dir, item)
-        EN, MI, SF, AG, SD, CC, SCD, VIF, MSE, PSNR, Qabf, Nabf, SSIM, MS_SSIM = evaluation_one(ir_name, vi_name, f_name)
+        EN, MI, SF, AG, SD, CC, SCD, VIF, MSE, PSNR, Qabf, Nabf, SSIM, MS_SSIM = evaluation_one(ir_name, vi_name, f_name, crop_size)
         EN_list.append(EN)
         MI_list.append(MI)
         SF_list.append(SF)
@@ -365,5 +466,77 @@ def evaluation_one_method(dataset_name='NSLSR_test', data_dir='./data/', result_
 
     return EN_list[-2:-1], MI_list[-2:-1], SF_list[-2:-1], AG_list[-2:-1], SD_list[-2:-1], CC_list[-2:-1], SCD_list[-2:-1], VIF_list[-2:-1], MSE_list[-2:-1], PSNR_list[-2:-1], Qabf_list[-2:-1], Nabf_list[-2:-1], SSIM_list[-2:-1], MS_SSIM_list[-2:-1]
 
-if __name__ == '__main__':
-    EN, MI, SF, AG, SD, CC, SCD, VIF, MSE, PSNR, Qabf, Nabf, SSIM, MS_SSIM = evaluation_one_method(result_dir='/IRFusion-main/LSFDNet/core/Metric_fusion/Results/NSLSR', save_dir='/IRFusion-main/LSFDNet/core/Metric_fusion/metric/metric_LS_320_all.xlsx', Method='LS')
+def evaluation_one_method_test(dataset_name='NSLSR_test', data_dir='./data/', result_dir='./LSFDNet/test/NSLSR/LSFDNet_320', save_dir='./LSFDNet/test/metric_LSFDNet.xlsx', Method='LSFDNet' , with_mean=True, crop_size=(768,768)):
+    MI_list = []
+    # SF_list = []
+    VIF_list = []
+    PSNR_list = []
+    Qabf_list = []
+    filename_list = []
+    ir_dir = os.path.join(data_dir, 'ir')
+    vi_dir = os.path.join(data_dir, 'vi')
+    f_dir = result_dir
+    metric_save_name = save_dir
+    filelist = natsorted([file for file in os.listdir(ir_dir) if file.lower().endswith(('.jpg', '.png'))])
+    eval_bar = tqdm(filelist)
+    for _, item in enumerate(eval_bar):
+        ir_name = os.path.join(ir_dir, item)
+        vi_name = os.path.join(vi_dir, item)
+        f_name = os.path.join(f_dir, item)
+        MI, SF, VIF, PSNR, Qabf= evaluation_one_test(ir_name, vi_name, f_name, crop_size)
+        MI_list.append(MI)
+        # SF_list.append(SF)
+        VIF_list.append(VIF)
+        PSNR_list.append(PSNR)
+        Qabf_list.append(Qabf)
+        filename_list.append(item)
+        eval_bar.set_description("{} | {}".format(Method, item))
+    if with_mean:
+        MI_list.append(np.mean(MI_list))
+        # SF_list.append(np.mean(SF_list))
+        VIF_list.append(np.mean(VIF_list))
+        PSNR_list.append(np.mean(PSNR_list))
+        Qabf_list.append(np.mean(Qabf_list))
+        filename_list.append('mean')
+
+
+        MI_list.append(np.std(MI_list))
+        # SF_list.append(np.std(SF_list))
+        VIF_list.append(np.std(VIF_list))
+        PSNR_list.append(np.std(PSNR_list))
+        Qabf_list.append(np.std(Qabf_list))
+        filename_list.append('std')
+
+    MI_list = [round(x, 3) for x in MI_list]
+    # SF_list = [round(x, 3) for x in SF_list]
+    VIF_list = [round(x, 3) for x in VIF_list]
+    PSNR_list = [round(x, 3) for x in PSNR_list]
+    Qabf_list = [round(x, 3) for x in Qabf_list]
+
+    filename_list.insert(0, '{}'.format(Method))
+    MI_list.insert(0, 'MI_list')
+    # SF_list.insert(0, 'SF_list')
+    VIF_list.insert(0, 'VIF_list')
+    PSNR_list.insert(0, 'PSNR_list')
+    Qabf_list.insert(0, 'Qabf_list')
+
+    write_excel(metric_save_name, 'all', 0, filename_list)
+    write_excel(metric_save_name, 'all', 1, MI_list)
+    # write_excel(metric_save_name, 'all', 3, SF_list)
+    write_excel(metric_save_name, 'all', 2, VIF_list)
+    write_excel(metric_save_name, 'all', 3, PSNR_list)
+    write_excel(metric_save_name, 'all', 4, Qabf_list)
+
+    column_num=0
+    write_excel(metric_save_name, 'MI', column_num, MI_list)
+    # write_excel(metric_save_name, 'SF', column_num, SF_list)
+    write_excel(metric_save_name, 'VIF', column_num, VIF_list)
+    write_excel(metric_save_name, 'PSNR', column_num, PSNR_list)
+    write_excel(metric_save_name, 'Qabf', column_num, Qabf_list)
+
+    return MI_list[-2:-1], VIF_list[-2:-1], PSNR_list[-2:-1], Qabf_list[-2:-1]
+
+if __name__ == '__main__':   
+    metric_r = evaluation_one_method_fast(dataset_name='NSLSR_test', data_dir='./data/NSLSR_val/', result_dir='./LSFDNet/core/Metric_fusion/Results/39', 
+                                                  save_dir= './LSFDNet/core/Metric_fusion/metric/' + 'out_metric_LS_39.xlsx', Method='LS' , 
+                                                  with_mean=True, crop_size=(320,320))

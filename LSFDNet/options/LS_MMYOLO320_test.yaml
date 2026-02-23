@@ -1,0 +1,168 @@
+# general settings
+name: test_MMYOLO
+model_type: MMYOLO
+phase: test
+num_gpu: 1
+manual_seed: 3407
+
+hyp: # Data augmentation settings. It's basically consistent with yolo with the deletion of HSV and Albumentations transformations.
+  close_mosaic: 200 #Close mosaic augmentation after this epoch.
+  fraction: 1.0 #Fraction of the dataset to use for training. 1.0 means using the whole dataset.
+  stride: 32 #Stride of the model. Used for calculating the grid size.
+  pad: 0.0 #Padding for the model.
+  deterministic: True #Deterministic training.
+  cache: disk #Use cache to speed up training.
+
+  augment: True #Use argument to speed up training
+  mosaic: 1.0 #Use mosaic data augmentation.
+  mixup: 0.0 #Use mixup data augmentation. Not used in this config!
+  degrees: 0.0 #Degree range for random rotations. Not used in this config!
+  translate: 0.0 #Translation for data augmentation. 0.1
+  scale: 0.0 #Scale for data augmentation.  0.5
+  shear: 0.0 #Shear intensity (angle in degrees). Not used in this config!
+  perspective: 0.0 #Perspective distortion factor. Not used in this config!
+  copy_paste_mode: 'flip' #Mode for copy-paste augmentation. Not used in this config!
+  copy_paste: 0.0 #Use copy-paste data augmentation. Not used in this config!
+  flipud: 0 #Use up-down flip data augmentation. Not used in this config!
+  fliplr: 0.5 #Use left-right flip data augmentation.
+  mask_ratio: 4 #Mask ratio for data augmentation
+  overlap_mask: True #Use overlap mask for data augmentation
+  bgr: 0.0 #Use BGR instead of RGB
+  hsv_h: 0.015 #HSV hue augmentation. Not used in this config!
+  hsv_s: 0.7 #HSV saturation augmentation. Not used in this config!
+  hsv_v: 0.4 #HSV value augmentation. Not used in this config!
+
+# dataset and data loader settings
+datasets:
+  train:
+    name: train
+    type: Fusion_YOLODataset
+    crop_size: 320
+    LW_path: './data/NSLSR_train/LWIR/'
+    SW_path: './data/NSLSR_train/SWIR/'
+    label_path: './data/NSLSR_train/labels/'
+    target_size: [320,320]
+    batch_size_per_gpu: 2
+    num_worker_per_gpu: 1
+    pin_memory: True
+    data_len: -1
+    prefetch_mode: Infinite
+
+  val:
+    # Please modify accordingly to use your own validation
+    # Or comment the val block if do not need validation during training
+    name: val
+    type: Fusion_YOLODataset
+    crop_size: 320
+    LW_path: './data/NSLSR320_val/LWIR/'
+    SW_path: './data/NSLSR320_val/SWIR/'
+    label_path: './data/NSLSR320_val/labels/'
+    target_size: [320,320]
+    batch_size_per_gpu: 8
+    num_worker_per_gpu: 1
+    pin_memory: True
+    data_len: -1
+    prefetch_mode: Infinite
+
+# network structures
+network_detfusion:
+  type: MMYOLO
+
+Det_labels:
+  nc: 1
+  conf: 0.001
+  iou: 0.7
+  iou_thres: 0.45
+  names: ["Ship"] #['ship','car','person']
+  conf_save: 0.4
+
+path:
+  pretrain_network_MMYOLO: ./PTH/net_LSFDNet_320.pth
+  strict_load_g: true
+  resume_state: ~
+
+# training settings
+train:
+  alpha: 0.5
+  beta: 0.5
+  sigma: 0.8
+  gamma: 2.7
+
+  optimizer_fusiondet:
+    type: SGD
+    lr: !!float 1e-4
+    momentum: 0.9
+    weight_decay: 0.0005
+
+  scheduler:
+    type: LambdaLR ##num_lambada=len(optimizer)!
+    lrf0: 0.01
+
+  compile: false
+  amp: true
+  ema: true
+  total_iter: 300000
+  warmup_iter: 3000  # -1 no warm up
+
+  #Loss
+  Loss_Fusiondet:
+    type: FusionDetloss_OE
+    device: cuda
+
+val:
+  pbar: true
+  data_dir: './data/NSLSR_test/'
+  name: 'NSLSR_test'
+  start_val: 0
+  val_freq: !!float 500
+  save_img: true
+  save_img_y: false
+  plot_det: true
+  save_txt: true
+  suffix: false
+ 
+  metrics:
+    EN: 
+      type: ~
+    SF: 
+      type: ~
+    AG: 
+      type: ~
+    SD: 
+      type: ~
+    CC: 
+      type: ~
+    SCD: 
+      type: ~
+    MSE: 
+      type: ~
+      better: lower
+    PSNR: 
+      type: ~
+    Qabf: 
+      type: ~
+    Nabf: 
+      type: ~
+      better: lower
+    mAP50:
+      type: ~
+    mAP50-95:
+      type: ~
+
+# logging settings
+logger:
+  print_net: true
+  print_freq: 50
+  only_save_log: false
+  start_save: 0
+  save_checkpoint_freq: !!float 500
+  only_save_last_best: true
+  use_tb_logger: true
+  wandb:
+    project: ~
+    resume_id: ~
+
+# dist training settings
+dist_params:
+  backend: nccl
+  port: 29500

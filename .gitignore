@@ -1,0 +1,11 @@
+/data/*
+!/data/README.md
+!data/readme.txt
+
+/PTH/*
+!/PTH/README.md
+!PTH/readme.txt
+
+__pycache__/
+*.pyc
+*.pyo

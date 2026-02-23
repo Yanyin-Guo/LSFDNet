@@ -4,7 +4,7 @@ from pathlib import Path
 import functools
 from collections import OrderedDict
 import torch
-import torch.nn as nn
+from torch import nn, optim
 from torch.nn import init
 from torch.nn.parallel import DataParallel, DistributedDataParallel
 import os
@@ -21,41 +21,25 @@ from tqdm import tqdm
 from ultralytics.utils import ops
 from ultralytics.utils.metrics import ConfusionMatrix, DetMetrics, box_iou
 from ultralytics.utils import LOGGER
-from losses.LS_loss import Pre_batch
 from losses.LS_loss import fuse_v8DetectionLoss
-#from ultralytics import YOLO
+import itertools
+from ultralytics.utils.torch_utils import ModelEMA, autocast
+from thop import profile
+from ptflops import get_model_complexity_info
 
 @MODEL_REGISTRY.register()
 class MMYOLO(BaseModel):
     def __init__(self, opt):
         super(MMYOLO, self).__init__(opt)
         logger = get_root_logger()
-        # define network and load pretrained models
-        self.netfusion =  build_network(opt['network_detfusion'])
-        self.netfusion = self.model_to_device(self.netfusion)
-        self.print_network(self.netfusion)
-
-        if isinstance(self.netfusion, (DataParallel, DistributedDataParallel)):
-            self.netfusion = self.netfusion.module
-        else:
-            self.netfusion = self.netfusion
-
-        if self.is_train:
-            self.init_training_settings()
-        else:
-            self.netfusion.eval()
-
-        load_path = self.opt['path'].get('pretrain_network_MMYOLO', None)
-        if load_path is not None:
-            self.load_network(self.netfusion, load_path, self.opt['path'].get('strict_load_g', True), 'params_MMYOLO')
-            logger.info(f"Pretrained model is successfully loaded from {opt['path']['pretrain_network_MMYOLO']}")
-
-        self.current_iter = 0
-        self.gama = opt['train']["a"]
-        self.b=opt['train']["b"]
-        self.c=opt['train']["c"]
-        # self._initialize_weights()  
-
+        self.batch_size = opt['datasets']['train']['batch_size_per_gpu']
+        self.target_size = self.opt['datasets']['train']['target_size']
+        self.is_compile = self.opt['train'].get('compile', False)
+        self.last_iter = 0
+        self.accumulate = 1
+        self.nw = max(round(opt['train']['warmup_iter']), 3000) if self.opt['train'].get('warmup_iter', -1) > 0 else 3000
+        # self.nw = max(round(opt['train']['warmup_iter']), 1000) if self.opt['train'].get('warmup_iter', -1) > 0 else 1000
+        self.expect_batch_size = 64
         self.seen = 0
         self.iouv = torch.linspace(0.5, 0.95, 10)  # IoU vector for mAP@0.5:0.95
         self.niou = self.iouv.numel()
@@ -79,6 +63,43 @@ class MMYOLO(BaseModel):
         self.metrics = DetMetrics(save_dir=self.save_dir)
         self.metrics.names = self.names
         self.metrics.plot = self.plots
+
+        # define network and load pretrained models
+        self.netfusiondet =  build_network(opt['network_detfusion'])
+        self.netfusiondet = torch.compile(self.netfusiondet) if self.is_compile else self.netfusiondet
+        self.netfusiondet = self.model_to_device(self.netfusiondet)
+        if opt['logger'].get('print_net', False):
+            self.print_network(self.netfusiondet)
+
+        if isinstance(self.netfusiondet, (DataParallel, DistributedDataParallel)):
+            self.netfusiondet = self.netfusiondet.module
+        else:
+            self.netfusiondet = self.netfusiondet
+
+        if self.is_train:
+            self.init_training_settings()
+        else:
+            self.netfusiondet.eval()
+            self.amp = torch.tensor(self.opt["train"].get('amp', False)).to(self.device)  # True or False
+            self.amp = bool(self.amp)  # as boolean
+
+        load_path = self.opt['path'].get('pretrain_network_MMYOLO', None)
+        if load_path is not None:
+            self.load_network(self.netfusiondet, load_path, self.opt['path'].get('strict_load_g', True), 'params_MMYOLO')
+            logger.info(f"Pretrained model is successfully loaded from {opt['path']['pretrain_network_MMYOLO']}")
+        
+        load_path = self.opt['path'].get('pretrain_network_MMFusion', None)
+        if load_path is not None and not opt['path']['resume_state']:
+            self.netfusion =  build_network(opt['network_prefusion'])
+            self.load_network(self.netfusion, load_path, self.opt['path'].get('strict_load_g', True), 'params_MMFusion')
+            self.transfer_weights(self.netfusion, self.netfusiondet)
+            logger.info(f"Pretrained model is successfully loaded from {opt['path']['pretrain_network_MMFusion']}")
+
+        self.current_iter = 0
+        self.alpha=opt['train']["alpha"]
+        self.beta=opt['train']["beta"]
+        self.sigma=opt['train']["sigma"]
+        self.gamma=opt['train']["gamma"]
  
     def transfer_weights(self, small_model, large_model):  
         small_model_state_dict = small_model.state_dict()  
@@ -86,101 +107,179 @@ class MMYOLO(BaseModel):
          
         for name, param in small_model_state_dict.items():  
             if name in large_model_state_dict:  
+                # print(name)
                 large_model_state_dict[name].data.copy_(param.data)  
 
     def _initialize_weights(self):  
         logger = get_root_logger()
         weights_init = functools.partial(core.weights_init.weights_init_normal)
-        self.netfusion.apply(weights_init)
+        self.netfusiondet.apply(weights_init)
         logger.info(f"Initialize weights of model")
     
     def init_training_settings(self):
-        self.netfusion.train()
+        self.netfusiondet.train()
         self.loss_dict_all = OrderedDict() 
         self.loss_dict_all['loss_all'] = []
-        self.loss_dict_all['loss_back'] = []
-        self.loss_dict_all['loss_label'] = []
-        self.loss_dict_all['loss_in'] = []
-        self.loss_dict_all['loss_grad'] = []
-        self.loss_dict_all['ls'] = []
-        self.loss_dict_all['lin'] = []
-        self.loss_dict_all['loss_det'] = []
         self.loss_dict_all['loss_fusion'] = []
+        self.loss_dict_all['loss_det'] = []
         # set up optimizers and schedulers
         self.setup_optimizers()
         self.setup_schedulers()
-        self.loss_LS = build_loss(self.opt['train']['Loss_OE']).to(self.device)
+        self.loss_LS = build_loss(self.opt['train']['Loss_Fusiondet']).to(self.device)
+        # Check AMP
+        self.amp = torch.tensor(self.opt["train"].get('amp', False)).to(self.device)  # True or False
+        self.amp = bool(self.amp)  # as boolean
+        self.scaler = (torch.amp.GradScaler("cuda", enabled=self.amp))
+        self.ema = self.opt['train'].get('ema', False)
+        if self.ema:
+            self.ema1 = ModelEMA(self.netfusiondet)
 
     def setup_optimizers(self):
         train_opt = self.opt['train']
-
-        optim_netfusion_params = list(self.netfusion.parameters())
-        optim_params_g_netfusion = [{  # add normal params first
-            'params': optim_netfusion_params,
-            'lr': train_opt['optimizer']['lr']
-        }]
-        optim_type = train_opt['optimizer'].pop('type')
-        lr = train_opt['optimizer']['lr']
-        self.optimizer_g_netfusion = self.get_optimizer(optim_type, optim_params_g_netfusion, lr)
+        for param in self.netfusiondet.netfe_base.parameters():
+            param.requires_grad = False
+        for param in self.netfusiondet.netfe_SW.parameters():
+            param.requires_grad = False
+        for param in self.netfusiondet.netfe_LW.parameters():
+            param.requires_grad = False
+        for param in self.netfusiondet.netMF_mulLayer.parameters():
+            param.requires_grad = False
+        for param in self.netfusiondet.netDe_fusion.parameters():
+            param.requires_grad = False
+        self.optimizer_g_netfusiondet = self.build_optimizer(self.netfusiondet, 
+                                                           name=train_opt['optimizer_fusiondet']['type'],
+                                                           lr=train_opt['optimizer_fusiondet']['lr'],
+                                                           momentum=train_opt['optimizer_fusiondet'].get('momentum', 0.9),
+                                                           decay=train_opt['optimizer_fusiondet'].get('weight_decay', 1e-5),
+                                                           iterations=train_opt['total_iter'])
+        self.optimizers.append(self.optimizer_g_netfusiondet)
+        self.optimizer_g_netfusiondet.zero_grad()
+        for param in self.netfusiondet.parameters():
+            param.requires_grad = False
+        for param in self.netfusiondet.netfe_base.parameters():
+            param.requires_grad = True
+        for param in self.netfusiondet.netfe_SW.parameters():
+            param.requires_grad = True
+        for param in self.netfusiondet.netfe_LW.parameters():
+            param.requires_grad = True
+        for param in self.netfusiondet.netMF_mulLayer.parameters():
+            param.requires_grad = True
+        for param in self.netfusiondet.netDe_fusion.parameters():
+            param.requires_grad = True
+        self.optimizer_g_netfusion = self.build_optimizer(self.netfusiondet, 
+                                                           name=train_opt['optimizer_fusion']['type'],
+                                                           lr=train_opt['optimizer_fusion']['lr'],
+                                                           momentum=train_opt['optimizer_fusion'].get('momentum', 0.9),
+                                                           decay=train_opt['optimizer_fusion'].get('weight_decay', 1e-5),
+                                                           iterations=train_opt['total_iter'])
         self.optimizers.append(self.optimizer_g_netfusion)
+        self.optimizer_g_netfusion.zero_grad()
+        for param in self.netfusiondet.parameters():
+            param.requires_grad = True
 
+    def build_optimizer(self, model, name="auto", lr=0.001, momentum=0.9, decay=1e-5, iterations=1e5):
+        logger = get_root_logger()
+        g = [], [], []  # optimizer parameter groups
+        bn = tuple(v for k, v in nn.__dict__.items() if "Norm" in k)  # normalization layers, i.e. BatchNorm2d()
+        if name == "auto":
+            logger.info(
+                f"{'optimizer:'} 'optimizer=auto' found, "
+                f"ignoring 'lr0' and 'momentum' and "
+                f"determining best 'optimizer', 'lr0' and 'momentum' automatically... "
+            )
+            nc = self.nc  # number of classes
+            lr_fit = round(0.002 * 5 / (4 + nc), 6)  # lr0 fit equation to 6 decimal places
+            name, lr, momentum = ("SGD", 0.01, 0.9) if iterations > 10000 else ("AdamW", lr_fit, 0.9)
+
+        for module_name, module in model.named_modules():
+            for param_name, param in module.named_parameters(recurse=False):
+                if not param.requires_grad:   # NOT FREEZE
+                    continue
+                fullname = f"{module_name}.{param_name}" if module_name else param_name
+                if "bias" in fullname:  # bias (no decay)
+                    g[2].append(param)
+                elif isinstance(module, bn):  # weight (no decay)
+                    g[1].append(param)
+                else:  # weight (with decay)
+                    g[0].append(param)
+
+        optimizers = {"Adam", "Adamax", "AdamW", "NAdam", "RAdam", "RMSProp", "SGD", "auto"}
+        name = {x.lower(): x for x in optimizers}.get(name.lower())
+        if name in {"Adam", "Adamax", "AdamW", "NAdam", "RAdam"}:
+            optimizer = getattr(optim, name, optim.Adam)(g[2], lr=lr, betas=(momentum, 0.999), weight_decay=0.0)
+        elif name == "RMSProp":
+            optimizer = optim.RMSprop(g[2], lr=lr, momentum=momentum)
+        elif name == "SGD":
+            optimizer = optim.SGD(g[2], lr=lr, momentum=momentum, nesterov=True)
+        else:
+            raise NotImplementedError(
+                f"Optimizer '{name}' not found in list of available optimizers {optimizers}. "
+                "Request support for addition optimizers at https://github.com/ultralytics/ultralytics."
+            )
+
+        optimizer.add_param_group({"params": g[0], "weight_decay": decay})  # add g0 with weight_decay
+        optimizer.add_param_group({"params": g[1], "weight_decay": 0.0})  # add g1 (BatchNorm2d weights)
+        logger.info(
+            f"{'optimizer:'} {type(optimizer).__name__}(lr={lr}, momentum={momentum}) with parameter groups "
+            f"{len(g[1])} weight(decay=0.0), {len(g[0])} weight(decay={decay}), {len(g[2])} bias(decay=0.0)"
+        )
+        return optimizer
+     
     # Feeding all data to the DF model
     def feed_data(self, train_data):
-        self.data = self.set_device(train_data[0])
-        self.set_device(train_data[1]['img'])
-        self.batch = train_data[1]
+        self.batch = train_data
+        self.data = {}
+        self.data['SW'] = self.set_device(self.batch['img'][:,:1,:,:])
+        self.data['LW'] = self.set_device(self.batch['an_img'][:,:1,:,:])
 
-    def cal_lam(self, citer):
-        if citer < self.opt['train']['loss_dict'][0] or citer > self.opt['train']['loss_dict'][1]:
-            lam = 0.9
-        else:
-            if citer < self.opt['train']['loss_dict'][0] + 1000:
-                lam = 0.9 - ((citer-self.opt['train']['loss_dict'][0])//100) * 0.2
-                lam = lam if lam > 0.1 else 0.1
-            else:
-                lam = 0.1 + ((citer-1000-self.opt['train']['loss_dict'][0])//375) * 0.1
-                lam = lam if lam < 0.9 else 0.9
-        return lam
-    
     # Optimize the parameters of the DF model
     def optimize_parameters(self, current_iter):
+        logger = get_root_logger()
         self.current_iter = current_iter
-        self.optimizer_g_netfusion.zero_grad()
         loss_dict = OrderedDict() 
-        self.pred_img, self.preds = self.netfusion(self.data)
-        loss_det, loss_ss, loss_back, loss_label, loss_in,loss_grad, ls, lin = self.loss_LS(self.b,self.c,image_vis=self.data["SW"], image_ir=self.data["LW"],  generate_img=self.pred_img, preds=self.preds, batch =self.batch, label=self.data["label"], LW_th=self.data["LW_th"])
-        for i in range(len(loss_label)):
-            if loss_label[i] !=0 :
-                loss_ss[i] = self.gama * loss_back[i] + (1-self.gama) * loss_label[i]
-            else:
-                loss_ss[i] = loss_back[i]
-        loss_det = loss_det.repeat(ls.size(0))/ls.size(0)
-        self.lam = self.cal_lam(current_iter) 
-        loss_all = (1-self.lam)*loss_ss + self.lam * loss_det * 0.01
-        loss_fs=loss_all.mean()
-        loss_fs.backward()
-        self.optimizer_g_netfusion.step()
+        # with autocast(self.amp):
+        with torch.cuda.amp.autocast(enabled=self.amp):
+            self.pred_img, self.preds = self.netfusiondet(self.data, self.amp, self.current_iter > self.nw, current_iter=self.current_iter, total_iter=self.opt['train']['total_iter']/2, warmup_iter=self.nw)
+            loss_det, loss_fusion = self.loss_LS(self.alpha, self.beta, self.sigma, self.gamma, image_SW=self.data["SW"], image_LW=self.data["LW"],  generate_img=self.pred_img, preds=self.preds, batch =self.batch)
+        loss_all = 10 * loss_fusion + loss_det
+        self.accumulate = max(1, int(np.interp(self.current_iter, [0, self.nw], [1, self.expect_batch_size / self.batch_size]).round()))
+        self.scaler.scale(loss_all/self.accumulate).backward()
+        # self.accumulate = 1
+        if self.current_iter - self.last_iter >= self.accumulate:
+            self.last_iter = current_iter
+            self.scaler.unscale_(self.optimizer_g_netfusiondet)  # unscale gradients
+            self.scaler.unscale_(self.optimizer_g_netfusion)  # unscale gradients
+            torch.nn.utils.clip_grad_norm_(self.netfusiondet.parameters(), max_norm=10.0)  # clip gradients
+            self.scaler.step(self.optimizer_g_netfusiondet)
+            self.scaler.step(self.optimizer_g_netfusion)
+            self.scaler.update()
+            self.optimizer_g_netfusiondet.zero_grad()
+            self.optimizer_g_netfusion.zero_grad()
+            if self.ema:
+                self.ema1.update(self.netfusiondet)
 
         loss_dict['loss_all'] = loss_all
-        loss_dict['loss_fusion'] = loss_ss
         loss_dict['loss_det'] = loss_det
-        loss_dict['loss_back'] = loss_back
-        loss_dict['loss_label'] = loss_label
-        loss_dict['loss_in'] = loss_in
-        loss_dict['loss_grad'] = loss_grad
-        loss_dict['ls'] = ls
-        loss_dict['lin'] = lin
+        loss_dict['loss_fusion'] = loss_fusion
         loss_dict = self.set_device(loss_dict)
         self.log_dict = self.reduce_loss_dict(loss_dict)
         for name, value in self.log_dict.items():
             self.loss_dict_all[name].append(value)
+    def ema_update(self):
+        if self.ema:
+            self.ema1.update_attr(self.netfusiondet)
 
     # Testing on given data
     def test(self):
-        self.netfusion.eval()
-        with torch.no_grad():
-            self.pred_img, self.preds= self.netfusion(self.data)
-        self.netfusion.train()
+        if getattr(self, 'is_ema_val', False) and hasattr(self, 'ema') and self.ema:
+            self.ema1.ema.eval()
+            with torch.no_grad():
+                self.pred_img, self.preds = self.ema1.ema(self.data)
+        else:
+            self.netfusiondet.eval()
+            with torch.no_grad():
+                self.pred_img, self.preds = self.netfusiondet(self.data, self.amp, True)
+            self.netfusiondet.train()
 
         return self.pred_img, self.preds
     
@@ -191,7 +290,12 @@ class MMYOLO(BaseModel):
                     if key == 'label':
                         x[key] = item.to(self.device, dtype=torch.int)
                     else:
-                        x[key] = item.to(self.device, dtype=torch.float)
+                        if isinstance(x[key], list):
+                            for item_1 in x[key]:
+                                if item_1 is not None and not isinstance(item_1, str) :
+                                    item_1 = item_1.to(self.device, dtype=torch.float)
+                        else:
+                            x[key] = item.to(self.device, dtype=torch.float)
         elif isinstance(x, list):
             for item in x:
                 if item is not None:
@@ -203,72 +307,77 @@ class MMYOLO(BaseModel):
     def dist_validation(self, dataloader, current_iter, tb_logger, save_img):
         if self.opt['rank'] == 0:
             self.nondist_validation(dataloader, current_iter, tb_logger, save_img)
-
+    
     def nondist_validation(self, dataloader, current_iter, tb_logger, save_img):
         dataset_name = self.opt['datasets']['val'].get('type')
+        self.dataset_name = self.opt['val'].get('name')
+        ema_suffix = '_EMA' if getattr(self, 'is_ema_val', False) else ''
+        if ema_suffix:
+            dataset_name = f"{dataset_name}{ema_suffix}"
+            self.dataset_name = f"{self.dataset_name}{ema_suffix}"
         with_metrics = self.opt['val'].get('metrics') is not None
         use_pbar = self.opt['val'].get('pbar', False)
-        save_plot_det = self.opt['val']['plot_det']
+        self.data_dir = self.opt['val'].get('data_dir')
+        self.save_plot_det = self.opt['val'].get('plot_det', False)
+        self.save_json = True
+        self.save_txt = self.opt['val']['save_txt']
         self.names = self.opt['Det_labels']['names']
         self.conf_test = self.opt['Det_labels']['conf_save']
-        self.pre_batch = Pre_batch()
         self.init_metrics()
         self.det = fuse_v8DetectionLoss(self.device)
         logger = get_root_logger()
 
-        if with_metrics and not hasattr(self, 'metric_results'):  # only execute in the first run
+        if with_metrics and not hasattr(self, 'metric_results'):  
             self.metric_results = {metric: 0 for metric in self.opt['val']['metrics'].keys()}
-        # initialize the best metric results for each dataset_name (supporting multiple validation datasets)
+        
         self._initialize_best_metric_results(dataset_name)
-        # zero self.metric_results
         if with_metrics:
             self.metric_results = {metric: 0 for metric in self.metric_results}
 
-        metric_data = dict()
         if use_pbar:
             pbar = tqdm(total=len(dataloader), unit='image')
 
-        # for idx, val_data in enumerate(dataloader):
         for idx, val_data in enumerate(dataloader):
-            img_name = osp.splitext(val_data[1]['im_name'][0])[0]
+            im_name = val_data['im_name']
             self.feed_data(val_data)
             self.pred_img, self.preds = self.test()
             self.preds = self.postprocess(self.preds)
-            self.batch = self.pre_pre_batch(self.batch)
-            self.batch = self.pre_batch.pre_process(self.batch)
             self.update_metrics(self.preds, self.batch)
             visuals = self.get_current_visuals()
-            sr_img = tensor2img(visuals['pred_img'].detach(), min_max=(0, 1))
-            metric_data['img'] = sr_img
-            # tentative for out of GPU memory
             torch.cuda.empty_cache()
 
-            if save_img:
-                if self.opt['is_train']:
-                    save_img_path = osp.join(self.opt['path']['visualization'], dataset_name, str(current_iter),
-                                             f'{img_name}.jpg')
-                else:
-                    if self.opt['val']['suffix']:
-                        save_img_path = osp.join(self.opt['path']['visualization'], dataset_name, str(current_iter),
-                                                 f'{img_name}_{self.opt["val"]["suffix"]}.jpg')
+            n=len(visuals['pred_img'])
+            for i in range(n):
+                sr_img = tensor2img(visuals['pred_img'][i].detach(), min_max=(0, 1))
+                img_name = osp.splitext(im_name[i])[0]
+                preds = self.preds[i]
+                
+                if save_img:
+                    if self.opt['is_train']:
+                        save_img_path = osp.join(self.opt['path']['visualization'], dataset_name, str(current_iter), f'{img_name}.png')
                     else:
-                        save_img_path = osp.join(self.opt['path']['visualization'], dataset_name, str(current_iter),
-                                                 f'{img_name}.jpg')
-                imwrite(sr_img, save_img_path)
-            if save_plot_det:
-                self.label_img = self.plot_det(self.preds, sr_img)
-                if self.opt['is_train']:
-                    save_img_label_path = osp.join(self.opt['path']['visualization'], dataset_name + '_label', str(current_iter),
-                                             f'{img_name}.jpg')
-                else:
-                    if self.opt['val']['suffix']:
-                        save_img_label_path = osp.join(self.opt['path']['visualization'], dataset_name + '_label', str(current_iter),
-                                                 f'{img_name}_{self.opt["val"]["suffix"]}.jpg')
+                        if self.opt['val']['suffix']:
+                            save_img_path = osp.join(self.opt['path']['visualization'], dataset_name, str(current_iter), f'{img_name}_{self.opt["val"]["suffix"]}.png')
+                        else:
+                            save_img_path = osp.join(self.opt['path']['visualization'], dataset_name, str(current_iter), f'{img_name}.png')
+                    imwrite(sr_img, save_img_path)
+                    
+                if self.save_plot_det:
+                    self.label_img = self.plot_det(preds, sr_img)
+                    if self.opt['is_train']:
+                        save_img_label_path = osp.join(self.opt['path']['visualization'], dataset_name + '_label', str(current_iter), f'{img_name}.png')
                     else:
-                        save_img_label_path = osp.join(self.opt['path']['visualization'], dataset_name + '_label', str(current_iter),
-                                                 f'{img_name}.jpg')
-                imwrite(self.label_img, save_img_label_path)
-
+                        if self.opt['val']['suffix']:
+                            save_img_label_path = osp.join(self.opt['path']['visualization'], dataset_name + '_label', str(current_iter), f'{img_name}_{self.opt["val"]["suffix"]}.png')
+                        else:
+                            save_img_label_path = osp.join(self.opt['path']['visualization'], dataset_name + '_label', str(current_iter), f'{img_name}.png')
+                    imwrite(self.label_img, save_img_label_path)
+                # if with_metrics:
+            #     visual = {'gt_SW': visuals['gt_SW'][i], 'gt_LW': visuals['gt_LW'][i], 'pred_img': visuals['pred_img'][i]}
+                # metric_fusion = evaluation_pic_fast(visual, crop_size=(self.batch['ori_shape'][i][0], self.batch['ori_shape'][i][1]))
+                # for k, v in metric_fusion.items():
+                #     metric_r.setdefault(k, []).append(v)
+                    
             if use_pbar:
                 pbar.update(1)
                 pbar.set_description(f'Test {img_name}')
@@ -280,21 +389,34 @@ class MMYOLO(BaseModel):
             self.speed = None
             self.finalize_metrics()
             log_str = ("%22s" + "%11s" * 6) % ("Class", "Images", "Instances", "Box(P", "R", "mAP50", "mAP50-95)")
-            pf = "%22s" + "%11i" * 2 + "%11.3g" * len(self.metrics.keys)  # print format
+            pf = "%22s" + "%11i" * 2 + "%11.3g" * len(self.metrics.keys) 
             log_str1 = pf % ("all", self.seen, self.nt_per_class.sum(), *self.metrics.mean_results())
             logger.info(log_str)
             logger.info(log_str1)
+            for i, c in enumerate(self.metrics.ap_class_index):
+                logger.info(pf % (self.names[c], self.nt_per_image[c], self.nt_per_class[c], *self.metrics.class_result(i)))
+            
+            self.current_det_metric = self.metrics.mean_results()[2] + self.metrics.mean_results()[3]
+            metric_f=['mAP50', 'mAP50-95']
+            for index, metric in enumerate(metric_f):
+                self.metric_results[metric] = self.metrics.mean_results()[2+index]
+                self._update_best_metric_result(dataset_name, metric, self.metric_results[metric], current_iter)
 
-            # self.print_results()
             r_dir, f_name = os.path.split(save_img_path) 
-            save_dir =  osp.join(self.opt['path']['visualization'], 'metric')
+            save_dir = osp.join(self.opt['path']['visualization'], 'metric')
             os.makedirs(save_dir, exist_ok=True)
-            metric_r = evaluation_one_method_fast(dataset_name='NSLSR_test', data_dir='/data', result_dir=r_dir, save_dir= save_dir+ f'/{current_iter}' + '_metric_C2FM.xlsx', Method='C2FM' , with_mean=True)
+            
+            excel_filename = f'/{current_iter}_metric_LS{ema_suffix}.xlsx'
+            metric_r = evaluation_one_method_fast(dataset_name=self.dataset_name, data_dir=self.data_dir, result_dir=r_dir, 
+                                                  save_dir= save_dir + excel_filename, Method='LS' , 
+                                                  with_mean=True, crop_size=(int(self.target_size[0]), int(self.target_size[1])))
+                                                  
             metric_f=['EN', 'SF', 'AG', 'SD', 'CC', 'SCD', 'MSE', 'PSNR', 'Qabf', 'Nabf']
             for index, metric in enumerate(metric_f):
                 self.metric_results[metric] = metric_r[index][0]
                 self._update_best_metric_result(dataset_name, metric, self.metric_results[metric], current_iter)
 
+            self.current_fusion_metric = self.metric_results['Qabf']
             self._log_validation_metric_values(current_iter, dataset_name, tb_logger)
 
     def _log_validation_metric_values(self, current_iter, dataset_name, tb_logger):
@@ -311,7 +433,7 @@ class MMYOLO(BaseModel):
             if tb_logger:
                 for metric, value in self.metric_results.items():
                     tb_logger.add_scalar(f'metrics/{dataset_name}/{metric}', value, current_iter)
-
+    
     # Get current log
     def get_current_iter_log(self):
         #self.update_loss()
@@ -320,15 +442,16 @@ class MMYOLO(BaseModel):
     def get_current_log(self):
         for name, value in self.log_dict.items():
             self.log_dict[name] = np.average(self.loss_dict_all[name])
+        return self.log_dict
+    
+    def save_current_log_img(self):
         visuals = self.get_current_visuals()
         grid_img = torch.cat((visuals['pred_img'].detach(),
                                     visuals['gt_SW'],
                                     visuals['gt_LW']), dim=0)
         grid_img = tensor2img(grid_img, min_max=(0, 1))
-        save_img_path = os.path.join(self.opt['path']['visualization'],'img_fused_iter_{}.jpg'.format(self.current_iter))
+        save_img_path = os.path.join(self.opt['path']['visualization'],'img_fused_iter_{}.png'.format(self.current_iter))
         imwrite(grid_img, save_img_path)
-        return self.log_dict
-
 
     # Get current visuals
     def get_current_visuals(self):
@@ -338,10 +461,69 @@ class MMYOLO(BaseModel):
         out_dict['gt_LW'] = self.data["LW"]
         return out_dict
     
+    def get_current_model_score(self):
+        return self.current_det_metric if hasattr(self, 'current_det_metric') else 0
+    
     def save(self, epoch, current_iter):
-        self.save_network([self.netfusion], 'net_fe_g', current_iter, param_key=['params_MMYOLO'])
-        self.save_training_state(epoch, current_iter)
+        self.save_network([self.netfusiondet], 'net_fe_g', current_iter, param_key=['params_MMYOLO'])
 
+        if hasattr(self, 'ema') and self.ema:
+            self.save_network([self.ema1.ema], 'net_fe_g_ema', current_iter, param_key=['params_MMYOLO'])
+            
+        self.save_training_state(epoch, current_iter)
+    
+    def save_best(self, current_iter):
+        logger = get_root_logger()
+        self.save_network([self.netfusiondet], 'net_best', current_iter, param_key=['params_MMYOLO'])
+        
+        if hasattr(self, 'ema') and self.ema:
+            self.save_network([self.ema1.ema], 'net_best_ema', current_iter, param_key=['params_MMYOLO'])
+            
+        logger.info(f"Saving new best-model")
+
+    def remove(self, pre_iter):
+        logger = get_root_logger()
+        if pre_iter > 0:
+            model_path = os.path.join(self.opt['path']['models'], f"net_fe_g_{pre_iter}.pth")
+            ema_model_path = os.path.join(self.opt['path']['models'], f"net_fe_g_ema_{pre_iter}.pth")
+            state_path = os.path.join(self.opt['path']['training_states'], f'{pre_iter}.state')
+            
+            if os.path.exists(model_path):
+                os.remove(model_path)
+                logger.info(f"Deleted old model file: {model_path}")
+            else:
+                logger.info(f"Old model file not found: {model_path}")
+                
+            if hasattr(self, 'ema') and self.ema:
+                if os.path.exists(ema_model_path):
+                    os.remove(ema_model_path)
+                    logger.info(f"Deleted old EMA model file: {ema_model_path}")
+                else:
+                    logger.info(f"Old EMA model file not found: {ema_model_path}")
+            
+            if os.path.exists(state_path):
+                os.remove(state_path)
+                logger.info(f"Deleted old state file: {state_path}")
+            else:
+                logger.info(f"Old state file not found: {state_path}")
+    
+    def remove_best(self, best_iter):
+        logger = get_root_logger()
+        if best_iter > 0:
+            model_path = os.path.join(self.opt['path']['models'], f"net_best_{best_iter}.pth")
+            ema_model_path = os.path.join(self.opt['path']['models'], f"net_best_ema_{best_iter}.pth")
+            
+            if os.path.exists(model_path):
+                os.remove(model_path)
+                logger.info(f"Deleted old best-model file: {model_path}")
+            else:
+                logger.info(f"Old best-model file not found: {model_path}")
+                
+            if hasattr(self, 'ema') and self.ema:
+                if os.path.exists(ema_model_path):
+                    os.remove(ema_model_path)
+                    logger.info(f"Deleted old best EMA model file: {ema_model_path}")
+    
     def init_metrics(self):
         self.confusion_matrix = ConfusionMatrix(nc=self.nc, conf=self.conf)
         self.seen = 0
@@ -349,20 +531,21 @@ class MMYOLO(BaseModel):
         self.stats = dict(tp=[], conf=[], pred_cls=[], target_cls=[], target_img=[])
 
     def plot_det(self, preds, img):
-        pred = preds[0]
+        color = [(0, 0, 255),(0, 255, 0),(255, 0, 0), (0, 255, 255),(255, 255, 0),(255, 0, 255)]
+        # pred = preds[0]
         img = np.stack((img,) * 3, axis=-1)  
-        for (x1, y1, x2, y2, conf, cls) in pred.cpu().detach().numpy():
+        for (x1, y1, x2, y2, conf, cls) in preds.cpu().detach().numpy():
             if conf >= self.conf_test:   
-                color = (0, 0, 255) 
+                # color = (0, 0, 255) 
                 color1 = (255, 255, 255) 
                 x1, y1, x2, y2 = map(int, (x1, y1, x2, y2))
-                cv2.rectangle(img, (x1, y1), (x2, y2), color, 2)  
+                cv2.rectangle(img, (x1, y1), (x2, y2), color[int(cls%6)], 2)  
 
                 label = f"{self.names[int(cls)]}: {conf:.2f}"  
                 background_tl = (x1, y1-18)   
                 background_br = (x1+93, y1)
- 
-                cv2.rectangle(img, background_tl, background_br, color, thickness=-1) 
+
+                cv2.rectangle(img, background_tl, background_br, color[int(cls)], thickness=-1) 
                 cv2.putText(img, label, (x1, y1 - 2), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color1, 1, lineType=cv2.LINE_AA)
                 
         return img

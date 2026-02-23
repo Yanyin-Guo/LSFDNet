@@ -1,25 +1,28 @@
 import torch
 from torch import nn
+import torch.nn.functional as F
 import math
 from basicsr.utils.registry import ARCH_REGISTRY
 from ultralytics.nn.modules.block import Conv, C3k2, A2C2f
 from ultralytics.nn.modules import Concat, Detect
 from basicsr.utils.registry import ARCH_REGISTRY
+from ultralytics.utils.torch_utils import ModelEMA, autocast
+from torch.utils.checkpoint import checkpoint
 
 def conv_block(in_channels, out_channels, kernel_size=3, stride=1, act_fn='relu', use_pad=True):  
     layers = []  
     if use_pad:  
-        layers.append(nn.ReflectionPad2d((kernel_size // 2, kernel_size // 2,  
-                                          kernel_size // 2, kernel_size // 2)))  
+        # layers.append(nn.ReflectionPad2d((kernel_size // 2, kernel_size // 2,  
+        #                                   kernel_size // 2, kernel_size // 2)))  
+        layers.append(nn.ReplicationPad2d(kernel_size // 2))
     layers.extend([  
         nn.Conv2d(in_channels, out_channels, kernel_size=kernel_size, stride=stride),  
         nn.BatchNorm2d(out_channels),  
     ])  
-    if act_fn != None:
-        if act_fn.lower() == 'relu':  
-            layers.append(nn.ReLU())  
-        elif act_fn.lower() == 'prelu':  
-            layers.append(nn.PReLU())  
+    if act_fn.lower() == 'relu':  
+        layers.append(nn.ReLU())  
+    elif act_fn.lower() == 'prelu':  
+        layers.append(nn.PReLU())  
     return nn.Sequential(*layers)  
 
 def mlp_block(dim, hidden_mult=2):  
@@ -56,42 +59,136 @@ class FeatureExtractorMulNet(nn.Module):
 
     def forward(self, x):  
         return self.Mul_1(x)  
+class PositionalEncoding(nn.Module):
+    def __init__(self, d_model, dropout=0.1, max_len=2048):
+        super(PositionalEncoding, self).__init__()
+        self.dropout = nn.Dropout(p=dropout)
+        pe = torch.zeros(max_len, d_model)
+        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        pe = pe.unsqueeze(0)
+        self.register_buffer('pe', pe)
 
-class PositionalEncoding(nn.Module):  
-    def __init__(self, d_model, dropout, max_len=5000):  
-        super(PositionalEncoding, self).__init__()  
-        self.dropout = nn.Dropout(p=dropout)  
-        pe = torch.zeros(max_len, d_model)  
-        position = torch.arange(0, max_len).unsqueeze(1)  
-        div_term = torch.exp(torch.arange(0, d_model, 2) * -(math.log(10000.0) / d_model))  
-        pe[:, 0::2] = torch.sin(position * div_term)  
-        pe[:, 1::2] = torch.cos(position * div_term)  
-        pe = pe.unsqueeze(0)  
-        self.register_buffer('pe', pe)  
+    def forward(self, x):
+        x = x + self.pe[:, :x.size(1)]
+        return self.dropout(x)
 
-    def forward(self, x):  
-        x = x + self.pe[:, :x.size(1)].to(x.device)  
-        return self.dropout(x)  
+class PatchEmbed(nn.Module):
+    """ 
+    将 2D 图像切分成 Patch Embedding
+    (B, C, H, W) -> (B, N, Embed_dim) 
+    """
+    def __init__(self, img_size=None, patch_size=8, in_chans=4, embed_dim=256):
+        super().__init__()
+        self.patch_size = patch_size
+        self.in_chans = in_chans
+        self.embed_dim = embed_dim
+        
+        self.proj = nn.Conv2d(in_chans, embed_dim, kernel_size=patch_size, stride=patch_size)
+        self.norm = nn.LayerNorm(embed_dim)
 
-def apply_attention(input_s, MHA, is_cross=False, query=None, key_value=None):  
-    embeding_dim = input_s.size(2) if not is_cross else query.size(2)  
-    if MHA.training:
-        PE = PositionalEncoding(embeding_dim, 0.1).train()
-    else:
-        PE = PositionalEncoding(embeding_dim, 0.1).eval() 
-    if is_cross:  
-        q = PE(query)  
-        k = PE(key_value)  
-        v = key_value  
-    else:  
-        q = PE(input_s)  
-        k = PE(input_s)  
-        v = input_s 
-    attention_output = MHA(q, k, v)[0]  
-    return attention_output + (query if is_cross else input_s)  
+    def forward(self, x):
+        # x: (B, C, H, W)
+        x = self.proj(x)            # -> (B, Embed_dim, H/P, W/P)
+        x = x.flatten(2)            # -> (B, Embed_dim, N)
+        x = x.transpose(1, 2)       # -> (B, N, Embed_dim) 符合 Transformer 输入格式
+        x = self.norm(x)
+        return x
 
+class PatchUnEmbed(nn.Module):
+    """
+    将 Patch Embedding 恢复成 2D 图像
+    (B, N, Embed_dim) -> (B, C, H, W)
+    """
+    def __init__(self, patch_size=8, out_chans=4, embed_dim=256):
+        super().__init__()
+        self.patch_size = patch_size
+        self.embed_dim = embed_dim
+        self.proj = nn.ConvTranspose2d(embed_dim, out_chans, kernel_size=patch_size, stride=patch_size)
+
+    def forward(self, x, H, W):
+        B, N, C = x.shape
+        h_new = H // self.patch_size
+        w_new = W // self.patch_size
+        
+        x = x.transpose(1, 2).reshape(B, C, h_new, w_new)
+        x = self.proj(x) # -> (B, out_chans, H, W)
+        return x
+class DINOv3SelfAttention(nn.Module):
+    def __init__(self, dim, num_heads=8, qkv_bias=False, proj_bias=True, attn_drop=0., proj_drop=0.):
+        super().__init__()
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+        self.scale = self.head_dim ** -0.5
+
+        self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
+        self.attn_drop = nn.Dropout(attn_drop)
+        self.proj = nn.Linear(dim, dim, bias=proj_bias)
+        self.proj_drop = nn.Dropout(proj_drop)
+
+    def forward(self, x, pos_encoding_obj=None):
+        B, N, C = x.shape
+        qkv = self.qkv(x)
+        qkv = qkv.reshape(B, N, 3, self.num_heads, self.head_dim)
+        
+        q, k, v = qkv.unbind(2)
+        q = q.transpose(1, 2)
+        k = k.transpose(1, 2)
+        v = v.transpose(1, 2)
+        if pos_encoding_obj is not None:
+            pe = pos_encoding_obj.pe[:, :N, :].reshape(1, N, self.num_heads, self.head_dim).transpose(1, 2)
+            q = q + pe
+            k = k + pe
+        x = F.scaled_dot_product_attention(
+            q, k, v, 
+            dropout_p=self.attn_drop.p if self.training else 0.,
+            scale=self.scale
+        )
+        x = x.transpose(1, 2).reshape(B, N, C)
+        x = self.proj(x)
+        x = self.proj_drop(x)
+        return x
+class DINOv3CrossAttention(nn.Module):
+    def __init__(self, dim, num_heads=8, qkv_bias=False, proj_bias=True, attn_drop=0., proj_drop=0.):
+        super().__init__()
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+        self.scale = self.head_dim ** -0.5
+
+        self.q_proj = nn.Linear(dim, dim, bias=qkv_bias)      # Query 来源
+        self.kv_proj = nn.Linear(dim, dim * 2, bias=qkv_bias) # Key/Value 来源 (合并以提速)
+        
+        self.attn_drop = nn.Dropout(attn_drop)
+        self.proj = nn.Linear(dim, dim, bias=proj_bias)
+        self.proj_drop = nn.Dropout(proj_drop)
+
+    def forward(self, x, context, pos_encoding_obj=None):
+        B, N, C = x.shape
+        q = self.q_proj(x).reshape(B, N, self.num_heads, self.head_dim).transpose(1, 2)
+        kv = self.kv_proj(context).reshape(B, N, 2, self.num_heads, self.head_dim)
+        k, v = kv.unbind(2)
+        k = k.transpose(1, 2)
+        v = v.transpose(1, 2)
+
+        if pos_encoding_obj is not None:
+            pe = pos_encoding_obj.pe[:, :N, :].reshape(1, N, self.num_heads, self.head_dim).transpose(1, 2)
+            q = q + pe
+            k = k + pe
+
+        x = F.scaled_dot_product_attention(
+            q, k, v, 
+            dropout_p=self.attn_drop.p if self.training else 0.,
+            scale=self.scale
+        )
+
+        x = x.transpose(1, 2).reshape(B, N, C)
+        x = self.proj(x)
+        x = self.proj_drop(x)
+        return x
 class CrossFusion(nn.Module):  
-    def __init__(self, size=8, dropout=0.1, channel=4):  
+    def __init__(self, size=8, dropout=0.1, channel=4, num_heads=8):  
         super(CrossFusion, self).__init__()  
         self.size = size  
         self.dim = size * size * channel  
@@ -103,45 +200,78 @@ class CrossFusion(nn.Module):
             conv_block(8, 4, 3, act_fn='prelu'),  
             conv_block(4, 4, 3, act_fn='prelu'),  
         )  
-        
-        self.mlp_SA_SWIR = mlp_block(self.dim)  
-        self.mlp_SA_LWIR = mlp_block(self.dim)  
-        self.mlp_CA_SWIR = mlp_block(self.dim)  
-        self.mlp_CA_LWIR = mlp_block(self.dim)  
+        self.pos_encoder = PositionalEncoding(d_model=self.dim, dropout=dropout, max_len=10000)
+        self.patch_embed_swir = PatchEmbed(patch_size=size, in_chans=4, embed_dim=self.dim)
+        self.patch_embed_lwir = PatchEmbed(patch_size=size, in_chans=4, embed_dim=self.dim)
+        self.patch_unembed_swir = PatchUnEmbed(patch_size=size, out_chans=4, embed_dim=self.dim)
+        self.patch_unembed_lwir = PatchUnEmbed(patch_size=size, out_chans=4, embed_dim=self.dim)
 
-        self.SA_SWIR, self.SA_LWIR, self.CA_SWIR, self.CA_LWIR = [  
-            nn.MultiheadAttention(self.dim, 1, dropout) for _ in range(4)  
-        ]  
+        self.mlp_SA_SWIR = mlp_block(self.dim)
+        self.mlp_SA_LWIR = mlp_block(self.dim)
+        self.mlp_CA_SWIR = mlp_block(self.dim)
+        self.mlp_CA_LWIR = mlp_block(self.dim)
+        
+        self.norm_sa_swir = nn.LayerNorm(self.dim)
+        self.norm_sa_lwir = nn.LayerNorm(self.dim)
+        self.norm_ca_swir = nn.LayerNorm(self.dim)
+        self.norm_ca_lwir = nn.LayerNorm(self.dim)
+        assert self.dim % num_heads == 0, "Dim must be divisible by num_heads"
+        
+        self.SA_SWIR = DINOv3SelfAttention(self.dim, num_heads=num_heads, attn_drop=dropout)
+        self.SA_LWIR = DINOv3SelfAttention(self.dim, num_heads=num_heads, attn_drop=dropout)
+        
+        self.CA_SWIR = DINOv3CrossAttention(self.dim, num_heads=num_heads, attn_drop=dropout)
+        self.CA_LWIR = DINOv3CrossAttention(self.dim, num_heads=num_heads, attn_drop=dropout)
         self.Decoder_mul = nn.Sequential(  
             conv_block(8, 8, 3, act_fn='prelu'),  
             conv_block(8, 16, 3, act_fn='prelu'),  
             conv_block(16, 16, 3, act_fn='prelu'),  
             conv_block(16, 8, 3, act_fn='prelu')
         )  
+        self.initialize_weights()  # 调用初始化方法
 
-    def forward(self, feats_SW, feats_LW):  
-        HW_size = feats_SW.size(3)  
-        unflod_win = nn.Unfold(kernel_size=(self.size, self.size), stride=self.size)  
-        flod_win = nn.Fold(output_size=(HW_size, HW_size), kernel_size=(self.size, self.size), stride=self.size)  
+    def initialize_weights(self):
+        for module in self.modules():
+            if isinstance(module, nn.Conv2d):
+                nn.init.kaiming_normal_(module.weight, mode='fan_out', nonlinearity='relu')
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+            elif isinstance(module, nn.Linear):
+                nn.init.xavier_normal_(module.weight)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+            elif isinstance(module, nn.BatchNorm2d):
+                nn.init.ones_(module.weight)
+                nn.init.zeros_(module.bias)
 
-        SWIR_scale_f = self.SWIREncoder(feats_SW)  
-        LWIR_scale_f = self.LWIREncoder(feats_LW)  
+    def forward(self, feats_SW, feats_LW):
+        SWIR_scale_f = self.SWIREncoder(feats_SW)
+        LWIR_scale_f = self.LWIREncoder(feats_LW)
+        B, C, H, W = SWIR_scale_f.shape
+        swir_tokens = self.patch_embed_swir(SWIR_scale_f)
+        lwir_tokens = self.patch_embed_lwir(LWIR_scale_f)
 
-        SWIR_unfolded = unflod_win(SWIR_scale_f).permute(2, 0, 1)  
-        LWIR_unfolded = unflod_win(LWIR_scale_f).permute(2, 0, 1)  
+        swir_norm = self.norm_sa_swir(swir_tokens)
+        swir_att = self.SA_SWIR(swir_norm, pos_encoding_obj=self.pos_encoder)
+        swir_tokens = swir_tokens + self.mlp_SA_SWIR(swir_att)
+        lwir_norm = self.norm_sa_lwir(lwir_tokens)
+        lwir_att = self.SA_LWIR(lwir_norm, pos_encoding_obj=self.pos_encoder)
+        lwir_tokens = lwir_tokens + self.mlp_SA_LWIR(lwir_att)
 
-        SWIR_att = self.mlp_SA_SWIR(apply_attention(SWIR_unfolded, self.SA_SWIR))  
-        LWIR_att = self.mlp_SA_LWIR(apply_attention(LWIR_unfolded, self.SA_LWIR))  
 
-        SWIR_cross = self.mlp_CA_SWIR(apply_attention(SWIR_att, self.CA_SWIR, is_cross=True,  
-                                                      query=SWIR_att, key_value=LWIR_att))  
-        LWIR_cross = self.mlp_CA_LWIR(apply_attention(LWIR_att, self.CA_LWIR, is_cross=True,  
-                                                      query=LWIR_att, key_value=SWIR_att))  
+        swir_ctx = swir_tokens
+        lwir_ctx = lwir_tokens
 
-        SWIR_reconstructed = flod_win(SWIR_cross.permute(1, 2, 0))  
-        LWIR_reconstructed = flod_win(LWIR_cross.permute(1, 2, 0))  
+        swir_norm = self.norm_ca_swir(swir_tokens)
+        swir_cross = self.CA_SWIR(swir_norm, context=lwir_ctx, pos_encoding_obj=self.pos_encoder)
+        swir_tokens = swir_tokens + self.mlp_CA_SWIR(swir_cross)
+        lwir_norm = self.norm_ca_lwir(lwir_tokens)
+        lwir_cross = self.CA_LWIR(lwir_norm, context=swir_ctx, pos_encoding_obj=self.pos_encoder)
+        lwir_tokens = lwir_tokens + self.mlp_CA_LWIR(lwir_cross)
+        SWIR_reconstructed = self.patch_unembed_swir(swir_tokens, H, W)
+        LWIR_reconstructed = self.patch_unembed_lwir(lwir_tokens, H, W)
 
-        f_cat = torch.cat([SWIR_reconstructed, LWIR_reconstructed], dim=1)  
+        f_cat = torch.cat([SWIR_reconstructed, LWIR_reconstructed], dim=1)
         enhance_f = self.Decoder_mul(f_cat)
         
         return enhance_f
@@ -167,20 +297,28 @@ class MulLayerFusion(nn.Module):
             conv_block(channel * 2, channel, 3, act_fn=act_fn),  
             conv_block(channel, channel, 3, act_fn=act_fn),  
         )  
-
+    
     def _make_upsample_layer(self, channel, act_fn):   
         return nn.Sequential(  
-            nn.ReflectionPad2d((1, 1, 1, 1)),  
-            nn.ConvTranspose2d(in_channels=channel, out_channels=channel, kernel_size=3, stride=2),  
-            nn.BatchNorm2d(channel),  
-            nn.PReLU(),  
+            # nn.ReflectionPad2d((1, 1, 1, 1)),  
+            # nn.ConvTranspose2d(in_channels=channel, out_channels=channel, kernel_size=3, stride=2),  
+            # nn.BatchNorm2d(channel),  
+            # nn.PReLU(),  
+            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
+            nn.ReflectionPad2d((1, 1, 1, 1)), 
+            nn.Conv2d(in_channels=channel, out_channels=channel, kernel_size=3, stride=1, padding=0),
+            nn.BatchNorm2d(channel),
+            nn.PReLU(),
             conv_block(channel, channel, 3, act_fn=act_fn),  
             conv_block(channel, channel * 2, 3, act_fn=act_fn),  
             conv_block(channel * 2, channel, 3, act_fn=act_fn),  
             conv_block(channel, channel, 3, act_fn=act_fn), 
-        )  
+        )
 
-    def forward(self, feats_SW, feats_LW, visual=False):    
+    @autocast(enabled=False)
+    def forward(self, feats_SW, feats_LW, visual=False):        
+        feats_SW = feats_SW.float()
+        feats_LW = feats_LW.float()
         fuse_h = self.CMAB_H(feats_SW, feats_LW)   
         down_fS = self.downsample_layer_SW(feats_SW)  
         down_fL = self.downsample_layer_LW(feats_LW)  
@@ -204,7 +342,7 @@ class Decoder(nn.Module):
         self.module = nn.Sequential(*layers)  
 
     def forward(self, x):  
-        return self.module(x)  
+        return self.module(x) 
     
 class Decoder_det_attn(nn.Module):
     def __init__(self):
@@ -217,9 +355,20 @@ class Decoder_det_attn(nn.Module):
             C3k2(16, 8, 1, False, 0.25),
             nn.Upsample(None, 2, 'nearest')
         )
+        self.init_weights()
+
+    def init_weights(self):
+        for m in self.modules():
+            if isinstance(m, (nn.Linear, nn.Conv2d)):
+                nn.init.normal_(m.weight, mean=0.0, std=0.02)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+            elif isinstance(m, nn.BatchNorm2d):
+                nn.init.zeros_(m.bias)
+                nn.init.ones_(m.weight)
+
     def forward(self, feats):
         out = self.Decoder_det(feats)
-
         return out
     
 @ARCH_REGISTRY.register()
@@ -304,8 +453,10 @@ class MMYOLO(nn.Module):
         self.enhance_1 = A2C2f(512, 256, 2, True, 4)
         self.enhance_2 = A2C2f(512, 256, 2, True, 4)
         self.enhance_3 = A2C2f(1024, 512, 2, True, 4)  
-    
-    def forward(self, data):
+        self.sigmoid = nn.Sigmoid()
+      
+    @autocast(enabled=False)
+    def forward(self, data, amp=True, attn=False, current_iter=None, total_iter=None, warmup_iter=None):
         feats_SW_base = self.netfe_base(data['SW'])
         feats_LW_base = self.netfe_base(data['LW'])
         feats_SW = self.netfe_SW(feats_SW_base)
@@ -350,9 +501,28 @@ class MMYOLO(nn.Module):
         x_20 = self.head_4(x_19)
         x_21 = self.Decoder([x_14, x_17, x_20])
         #######det
+        
+        feats_det = self.sigmoid(self.netDe_det_attn(x_14))
+        target_base = 0.6
+        target_det = 0.4
+        start_base = 0.99
+        start_det = 0.01
 
-        feats_det = self.netDe_det_attn(x_14)
-        feats_Mul_fused = feats_fused + feats_fused * feats_det
+        if current_iter is None:
+            w_base = target_base
+            w_det = target_det
+        elif current_iter < warmup_iter:
+            w_base = start_base
+            w_det = start_det
+        else:
+            total_steps = total_iter - warmup_iter
+            curr_steps = current_iter - warmup_iter
+            progress = curr_steps / max(1, total_steps)
+            progress = max(0.0, min(1.0, progress)) # 限制在 0-1 之间
+            w_base = start_base - (start_base - target_base) * progress
+            w_det = start_det + (target_det - start_det) * progress
+        
+        feats_Mul_fused = w_base * feats_fused + w_det * feats_fused * feats_det
         pred_img = self.netDe_fusion(feats_Mul_fused)
-
         return pred_img, x_21
+  

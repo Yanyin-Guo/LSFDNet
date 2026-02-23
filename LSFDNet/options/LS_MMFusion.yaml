@@ -5,43 +5,72 @@ phase: train
 num_gpu: 1
 manual_seed: 0
 
+hyp: # Data augmentation settings. It's basically consistent with yolo with the deletion of HSV and Albumentations transformations.
+  close_mosaic: 0 #Close mosaic augmentation after this epoch.
+  fraction: 1.0 #Fraction of the dataset to use for training. 1.0 means using the whole dataset.
+  stride: 32 #Stride of the model. Used for calculating the grid size.
+  pad: 0.0 #Padding for the model. 
+  deterministic: True #Deterministic training. 
+  cache: disk #Use cache to speed up training.
+
+  augment: True #Use argument to speed up training
+  mosaic: 1.0 #Use mosaic data augmentation.
+  mixup: 0.0 #Use mixup data augmentation. Not used in this config!
+  degrees: 0.0 #Degree range for random rotations. Not used in this config!
+  translate: 0.0 #Translation for data augmentation. 0.1
+  scale: 0.0 #Scale for data augmentation.  0.5
+  shear: 0.0 #Shear intensity (angle in degrees). Not used in this config!
+  perspective: 0.0 #Perspective distortion factor. Not used in this config!
+  copy_paste_mode: 'flip' #Mode for copy-paste augmentation. Not used in this config!
+  copy_paste: 0.0 #Use copy-paste data augmentation. Not used in this config!
+  flipud: 0 #Use up-down flip data augmentation. Not used in this config!
+  fliplr: 0.5 #Use left-right flip data augmentation.
+  mask_ratio: 4 #Mask ratio for data augmentation
+  overlap_mask: True #Use overlap mask for data augmentation
+  bgr: 0.0 #Use BGR instead of RGB
+  hsv_h: 0.015 #HSV hue augmentation. Not used in this config!
+  hsv_s: 0.7 #HSV saturation augmentation. Not used in this config!
+  hsv_v: 0.4 #HSV value augmentation. Not used in this config!
 
 # dataset and data loader settings
 datasets:
   train:
     name: train
-    type: OSLSP_FusionDataset
-    crop_size: 320
-    LW_path: '/data/NSLSR_train/LWIR/'
-    SW_path: '/data/NSLSR_train/SWIR/'
-    paired_path: '/data/NSLSR_train/gama/'
-    label_path: '/data/NSLSR_train/labels/'
-    is_crop: True
-    is_size: False
-    is_pad: False
-    batch_size_per_gpu: 16
-    num_worker_per_gpu: 6
+    type: Fusion_YOLODataset
+    crop_size: 640
+    LW_path: './data/NSLSR_train/LWIR/'
+    SW_path: './data/NSLSR_train/SWIR/'
+    label_path: './data/NSLSR_train/labels/'
+    target_size: [640,512]
+    batch_size_per_gpu: 8
+    num_worker_per_gpu: 1
     pin_memory: True
     data_len: -1
+    prefetch_mode: Infinite
 
   val:
     # Please modify accordingly to use your own validation
     # Or comment the val block if do not need validation during training
     name: val
-    type: OSLSP_FusionDataset
-    crop_size: 320
-    LW_path: '/data/NSLSR_test/LWIR/'
-    SW_path: '/data/NSLSR_test/SWIR/'
-    paired_path: '/data/NSLSR_test/gama/'
-    label_path: '/data/NSLSR_test/labels/'
-    is_crop: True
-    is_size: False
-    is_pad: False
+    type: Fusion_YOLODataset
+    crop_size: 640
+    LW_path: './data/NSLSR_val/LWIR/'
+    SW_path: './data/NSLSR_val/SWIR/'
+    label_path: './data/NSLSR_val/labels/'
+    target_size: [640,512]
     batch_size_per_gpu: 16
     num_worker_per_gpu: 1
     pin_memory: True
     data_len: -1
+    prefetch_mode: Infinite
 
+Det_labels:
+  nc: 1
+  conf: 0.001
+  iou: 0.7
+  iou_thres: 0.45
+  names: ["Ship"] #['ship','car','person']
+  conf_save: 0.25
 
 # network structures
 network_fusion:
@@ -49,37 +78,47 @@ network_fusion:
 
 # path
 path:
-  pretrain_network_MMFusion: ~
+  pretrain_network_MMFusion: ./PTH/net_MMFusion.pth
   training_states:
   strict_load_g: true
   resume_state: ~
 
 # training settings
 train:
-  a: 0.8 
-  b: 0.5 
-  c: 0.5  
-  #n_epoch: 300
-  optimizer:
+  alpha: 0.5
+  beta: 0.5
+  sigma: 0.8
+  gamma: 2.7
+
+  optimizer_fusion:
+    # type: SGD
+    # lr: !!float 1e-4
+    # momentum: 0.9
+    # weight_decay: 0.0005
     type: Adam
     lr: !!float 1e-4
 
   scheduler:
-    type: MultiStepLR
-    milestones: [50000, 75000, 100000, 150000, 200000]
-    gamma: 0.5
+    type: LambdaLR ##num_lambada=len(optimizer)!
+    lrf0: 0.01
 
+  compile: true
+  amp: true
+  ema: true
   total_iter: 300000
-  warmup_iter: 500  # -1 no warm up
+  warmup_iter: -1  # -1 no warm up
 
   #Loss
-  Loss_OE:
-    type: Fusionloss_LS
+  Loss_Fusion:
+    type: Fusionloss_OE
+    device: cuda
 
 val:
   pbar: true
+  data_dir: './data/NSLSR_test/'
+  name: 'NSLSR_test'
   start_val: 0
-  val_freq: !!float 500
+  val_freq: !!float 1000
   save_img: true
  
   metrics:
@@ -97,7 +136,7 @@ val:
       type: ~
     MSE: 
       type: ~
-      better: lower
+      better: lower  
     PSNR: 
       type: ~
     Qabf: 
@@ -106,12 +145,14 @@ val:
       type: ~
       better: lower
 
-
 # logging settings
 logger:
+  print_net: false
   print_freq: 50
+  only_save_log: false
   start_save: 0
-  save_checkpoint_freq: !!float 500
+  save_checkpoint_freq: !!float 1000
+  only_save_last_best: true
   use_tb_logger: true
   wandb:
     project: ~
